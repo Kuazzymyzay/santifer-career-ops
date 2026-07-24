@@ -5157,6 +5157,29 @@ try {
     fail('role matcher wrongly treated a "(Repost)" annotation as a distinct sibling role');
   }
 
+  // Slashed short acronyms used to vanish in tokenization ("(CI/CD)" → "ci cd"
+  // → both dropped by the length filter), so a sibling req whose ONLY
+  // distinguishing qualifier is a slashed acronym tokenized identically to the
+  // bare title — the #1881 subset guard never saw an extra token — and
+  // merge-tracker overwrote the Applied row's title/score/report (#2165).
+  if (!roleFuzzyMatch(
+    'Senior Software Engineer, Infrastructure',
+    'Senior Software Engineer, Infrastructure (CI/CD)'
+  )) {
+    pass('role matcher keeps a slash-acronym-qualified sibling req distinct (#2165)');
+  } else {
+    fail('role matcher still collapses sibling reqs whose only qualifier is a slashed acronym');
+  }
+
+  if (roleFuzzyMatch(
+    'Senior Software Engineer, Infrastructure (CI/CD)',
+    'Senior Software Engineer, Infrastructure CI/CD'
+  )) {
+    pass('role matcher still matches the same slash-acronym role across punctuation variants');
+  } else {
+    fail('role matcher stopped matching identical slash-acronym roles');
+  }
+
   const dedupTmp = mkdtempSync(join(tmpdir(), 'career-ops-dedup-'));
   try {
     mkdirSync(join(dedupTmp, 'data'));
@@ -5542,6 +5565,62 @@ try {
   }
 } catch (e) {
   fail(`merge-tracker fuzzy dedup tests crashed: ${e.message}`);
+}
+
+// merge-tracker used to clobber an Applied row when a sibling req's only
+// distinguishing qualifier was a slashed acronym: "(CI/CD)" tokenized to
+// nothing, the fuzzy tier matched, and the update path rewrote the existing
+// row's title/score/date/report. Two guards now cover it: slashed acronyms
+// survive tokenization, and non-report-number matches never rewrite the title.
+console.log('\n🧪 Testing merge-tracker sibling-req clobber guard (slash acronyms + title preservation)...');
+try {
+  const clobberTmp = mkdtempSync(join(tmpdir(), 'career-ops-clobber-'));
+  try {
+    mkdirSync(join(clobberTmp, 'data'));
+    mkdirSync(join(clobberTmp, 'reports'));
+    const additionsDir = join(clobberTmp, 'additions');
+    mkdirSync(additionsDir);
+    const tracker = join(clobberTmp, 'data', 'applications.md');
+    writeFileSync(tracker,
+      '# Applications Tracker\n\n' +
+      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      '| 1 | 2026-01-05 | Globex | Senior Software Engineer, Infrastructure | N/A | Applied | ❌ | - | source=applied |\n' +
+      '| 2 | 2026-01-08 | Acme | Senior Platform Engineer, Observability | 3.9/5 | Applied | ❌ | [2](../reports/002-acme-2026-01-08.md) | existing |\n');
+    for (const n of ['002-acme-2026-01-08', '003-globex-2026-01-09', '004-acme-2026-01-09']) {
+      writeFileSync(join(clobberTmp, 'reports', `${n}.md`), '# fixture\n');
+    }
+    // Sibling req whose only qualifier is a slashed acronym → must be ADDED.
+    writeFileSync(join(additionsDir, '003-globex.tsv'),
+      '3\t2026-01-09\tGlobex\tSenior Software Engineer, Infrastructure (CI/CD)\tEvaluated\t4.5/5\t✅\t[3](reports/003-globex-2026-01-09.md)\tdistinct req\n');
+    // True repost with reworded title → fuzzy update keeps the EXISTING title.
+    writeFileSync(join(additionsDir, '004-acme.tsv'),
+      '4\t2026-01-09\tAcme\tSr Platform Engineer, Observability (Remote)\tEvaluated\t4.2/5\t❌\t[4](reports/004-acme-2026-01-09.md)\trepost re-eval\n');
+
+    const clobberResult = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: tracker, CAREER_OPS_ADDITIONS: additionsDir } });
+    if (clobberResult === null) {
+      fail('merge-tracker.mjs crashed during sibling-req clobber guard test');
+    } else {
+      const merged = readFileSync(tracker, 'utf-8');
+
+      if (merged.includes('Senior Software Engineer, Infrastructure |') && merged.includes('Infrastructure (CI/CD)')) {
+        pass('slash-acronym sibling req added as its own row; Applied row untouched');
+      } else {
+        fail('slash-acronym sibling req clobbered the existing Applied row (regression)');
+      }
+
+      const acmeRows = merged.split('\n').filter(l => l.includes('Observability'));
+      if (acmeRows.length === 1 && acmeRows[0].includes('Senior Platform Engineer, Observability') && acmeRows[0].includes('4.2/5')) {
+        pass('fuzzy-tier update bumps score but preserves the existing role title');
+      } else {
+        fail(`fuzzy-tier title preservation broken: ${acmeRows.length} Observability rows: ${acmeRows.join(' // ')}`);
+      }
+    }
+  } finally {
+    rmSync(clobberTmp, { recursive: true, force: true });
+  }
+} catch (e) {
+  fail(`merge-tracker sibling-req clobber guard tests crashed: ${e.message}`);
 }
 
 // ── MERGE-TRACKER CROSS-CHANNEL VIA GUARD: NON-LATIN AGENCIES (#1603) ─────
