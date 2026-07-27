@@ -278,6 +278,7 @@ const SYSTEM_PATHS = [
   'test/cv-templates.test.mjs',
   'test/cover-resolver.test.mjs',
   'test/profile-photo.test.mjs',
+  'test/followup-view.test.mjs',
   'templates/cv-template.zh-minimal.html',
   'test/zh-minimal-template.test.mjs',
   'scaffolder/',
