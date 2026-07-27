@@ -277,6 +277,7 @@ const SYSTEM_PATHS = [
   'cv-templates.mjs',
   'test/cv-templates.test.mjs',
   'test/cover-resolver.test.mjs',
+  'test/apply-cv-resolver.test.mjs',
   'test/profile-photo.test.mjs',
   'templates/cv-template.zh-minimal.html',
   'test/zh-minimal-template.test.mjs',
