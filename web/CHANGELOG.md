@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/santifer/career-ops/compare/web-v0.3.0...web-v0.3.1) (2026-07-27)
+
+
+### Bug Fixes
+
+* **deps:** update dependency next to v16.2.11 [security] ([#2198](https://github.com/santifer/career-ops/issues/2198)) ([b6d1c87](https://github.com/santifer/career-ops/commit/b6d1c871d985c278af51d26fa51ef09274c1076b))
+
 ## [0.3.0](https://github.com/santifer/career-ops/compare/web-v0.2.0...web-v0.3.0) (2026-07-07)
 
 
