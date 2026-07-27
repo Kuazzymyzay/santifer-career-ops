@@ -293,6 +293,8 @@ const SYSTEM_PATHS = [
   'plugin-audit.mjs',
   'validate-plugin-registry.mjs',
   'config/plugins.example.yml',
+  'seed-fixture.mjs',
+  'test-fixtures/',
 ];
 
 const BOOTSTRAP_PATHS = [
