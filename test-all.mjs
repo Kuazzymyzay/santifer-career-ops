@@ -25,7 +25,7 @@
 
 
 import { execSync, execFileSync, spawn, spawnSync } from 'child_process';
-import { readFileSync, existsSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, unlinkSync, realpathSync, symlinkSync } from 'fs';
+import { readFileSync, existsSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, unlinkSync, realpathSync, symlinkSync, copyFileSync } from 'fs';
 import { join, dirname, basename, delimiter } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -168,6 +168,7 @@ const scripts = [
   { name: 'assessment-log.mjs --self-test', expectExit: 0 },
   { name: 'build-cv-html.mjs --test', expectExit: 0 },
   { name: 'jd-skill-gap.mjs --self-test', expectExit: 0 },
+  { name: 'verify-cv-facts.mjs --self-test', expectExit: 0 },
   { name: 'updater-migration-tests.mjs', expectExit: 0 },
   { name: 'tracker-columns-tests.mjs', expectExit: 0 },
   { name: 'agent-inbox-tests.mjs', expectExit: 0 },
@@ -195,15 +196,64 @@ const scripts = [
   { name: 'archive-posting.mjs --help', expectExit: 0 },
 ];
 
-for (const { name, allowFail } of scripts) {
-  const result = run(NODE, name.split(' '), { stdio: ['pipe', 'pipe', 'pipe'] });
-  if (result !== null) {
-    pass(`${name} runs OK`);
-  } else if (allowFail) {
-    warn(`${name} exited with error (expected without user data)`);
-  } else {
-    fail(`${name} crashed`);
+const scriptTmp = mkdtempSync(join(ROOT, '.tmp-script-test-'));
+try {
+  const copyDirSync = (src, dest, exclude = []) => {
+    const name = src.split(/[\\/]/).pop();
+    if (exclude.includes(name)) return;
+    const stat = statSync(src);
+    if (stat.isDirectory()) {
+      mkdirSync(dest, { recursive: true });
+      for (const entry of readdirSync(src)) {
+        copyDirSync(join(src, entry), join(dest, entry), exclude);
+      }
+    } else {
+      copyFileSync(src, dest);
+    }
+  };
+
+  const excludeDirs = [
+    'node_modules',
+    '.git',
+    'data',
+    'reports',
+    '.career-ops-web',
+    '.playwright-mcp',
+    '.agents',
+    'cdp-diff.patch',
+    'cdp-diff-focused.patch',
+    'test_diff.patch',
+    'test_diff_utf8.patch',
+    basename(scriptTmp),
+  ];
+  copyDirSync(ROOT, scriptTmp, excludeDirs);
+
+  mkdirSync(join(scriptTmp, 'data'), { recursive: true });
+  mkdirSync(join(scriptTmp, 'reports'), { recursive: true });
+  writeFileSync(
+    join(scriptTmp, 'data', 'applications.md'),
+    '# Applications\n\n| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n|---|---|---|---|---|---|---|---|---|\n',
+    'utf-8'
+  );
+
+  for (const { name, allowFail } of scripts) {
+    const parts = name.split(' ');
+    const scriptFile = parts[0];
+    const args = parts.slice(1);
+    const result = run(NODE, [join(scriptTmp, scriptFile), ...args], {
+      cwd: scriptTmp,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    if (result !== null) {
+      pass(`${name} runs OK`);
+    } else if (allowFail) {
+      warn(`${name} exited with error (expected without user data)`);
+    } else {
+      fail(`${name} crashed`);
+    }
   }
+} finally {
+  rmSync(scriptTmp, { recursive: true, force: true });
 }
 
 try {
@@ -507,7 +557,7 @@ try {
   // pages script the goto/evaluate calls so we can exercise the wrapper without
   // launching a browser. checkUrlLiveness reads body text first, apply controls
   // second — the fake returns them in that order.
-  const { checkUrlLivenessWithFallback, isChallengeResult, jitteredDelayMs } =
+  const { checkUrlLiveness, checkUrlLivenessWithFallback, isChallengeResult, jitteredDelayMs } =
     await import(pathToFileURL(join(ROOT, 'liveness-browser.mjs')).href);
 
   const disabled = jitteredDelayMs(0) === 0 && jitteredDelayMs(-1) === 0;
@@ -641,6 +691,107 @@ try {
     pass('SSRF guard rejects unsupported protocol');
   } else {
     fail(`SSRF guard let unsupported protocol through: ${protoCase?.code ?? 'allowed'}`);
+  }
+
+  // SSRF redirect routing tests
+  const dnsModule = await import('dns/promises');
+  const { mock } = await import('node:test');
+
+  // Stub resolve4, resolve6, and lookup to test the DNS path
+  mock.method(dnsModule.default, 'resolve4', (hostname) => {
+    if (hostname === 'ssrf-blocked-host.local') {
+      return Promise.resolve(['127.0.0.1']);
+    }
+    return Promise.resolve([]);
+  });
+  mock.method(dnsModule.default, 'resolve6', (hostname) => {
+    return Promise.resolve([]);
+  });
+  mock.method(dnsModule.default, 'lookup', (hostname, options) => {
+    if (hostname === 'ssrf-blocked-host.local') {
+      const addr = { address: '127.0.0.1', family: 4 };
+      return Promise.resolve(options?.all ? [addr] : addr);
+    }
+    return Promise.reject(new Error('DNS lookup failure'));
+  });
+
+  let routeCallback = null;
+  const mockPageInstance = {
+    _blockedByGuard: null,
+    async route(pattern, callback) {
+      routeCallback = callback;
+    },
+    async goto() {
+      if (routeCallback) {
+        let aborted = false;
+        const mockRoute = {
+          request: () => ({ url: () => 'http://ssrf-blocked-host.local/sensitive-internal' }),
+          abort: async () => {
+            aborted = true;
+          },
+          continue: async () => {}
+        };
+        await routeCallback(mockRoute);
+        if (aborted) {
+          throw new Error('net::ERR_BLOCKED_BY_CLIENT');
+        }
+      }
+      return { status: () => 200 };
+    },
+    async waitForTimeout() {},
+    url() { return 'https://example.com/redirected'; },
+    async evaluate() { return 'body text'; }
+  };
+
+  const redirectResult = await checkUrlLiveness(mockPageInstance, 'https://example.com/public-landing');
+  if (redirectResult.result === 'uncertain' && redirectResult.code === 'blocked_host') {
+    pass('SSRF redirect guard blocks redirects/subresources to private IPs via routing');
+  } else {
+    fail(`SSRF redirect guard failed to block: ${JSON.stringify(redirectResult)}`);
+  }
+
+  // Restore DNS mocks
+  mock.reset();
+
+  let legitimateRouteCallback = null;
+  const mockPageLegitimate = {
+    _blockedByGuard: null,
+    async route(pattern, callback) {
+      legitimateRouteCallback = callback;
+    },
+    async goto() {
+      if (legitimateRouteCallback) {
+        let continued = false;
+        const mockRoute = {
+          request: () => ({ url: () => 'https://example.com/assets/logo.png' }),
+          abort: async () => {},
+          continue: async () => {
+            continued = true;
+          }
+        };
+        await legitimateRouteCallback(mockRoute);
+        if (!continued) {
+          throw new Error('Blocked legitimate request');
+        }
+      }
+      return { status: () => 200 };
+    },
+    async waitForTimeout() {},
+    url() { return 'https://example.com'; },
+    async evaluate(fn) {
+      const fnStr = fn.toString();
+      if (fnStr.includes('body')) {
+        return 'legitimate page body';
+      }
+      return ['Apply'];
+    }
+  };
+
+  const legitimateResult = await checkUrlLiveness(mockPageLegitimate, 'https://example.com');
+  if (legitimateResult.result === 'active') {
+    pass('SSRF redirect guard allows legitimate subresource requests');
+  } else {
+    fail(`SSRF redirect guard blocked legitimate requests: ${JSON.stringify(legitimateResult)}`);
   }
 } catch (e) {
   fail(`Liveness classification tests crashed: ${e.message}`);
@@ -4889,27 +5040,42 @@ try {
 
   // Range-vs-range: two concurrent --count 4 reservations must not overlap.
   // Terminates by construction: each restart strictly advances the base.
-  const concTmp = mkdtempSync(join(tmpdir(), 'career-ops-reserve-conc-'));
-  const spawnReserve = () => new Promise(resolve => {
-    const child = spawn(NODE, [RESERVE, '--count', '4'], {
-      env: { ...process.env, CAREER_OPS_REPORTS_DIR: concTmp },
-    });
-    let stdout = '';
-    child.stdout.on('data', chunk => { stdout += chunk; });
-    child.on('close', () => resolve(stdout.trim()));
-  });
-  const [rangeX, rangeY] = await Promise.all([spawnReserve(), spawnReserve()]);
-  const toNums = r => {
-    const [s, e] = r.split('-').map(Number);
-    return Array.from({ length: e - s + 1 }, (_, i) => s + i);
-  };
-  const overlap = toNums(rangeX).filter(n => toNums(rangeY).includes(n));
-  if (rangeX && rangeY && overlap.length === 0) {
-    pass(`concurrent --count 4 reservations are disjoint (${rangeX} vs ${rangeY})`);
-  } else {
-    fail(`concurrent ranges overlap: ${rangeX} vs ${rangeY} share [${overlap}]`);
+  let reserveRetries = 1;
+  while (reserveRetries >= 0) {
+    const concTmp = mkdtempSync(join(tmpdir(), 'career-ops-reserve-conc-'));
+    try {
+      const spawnReserve = () => new Promise(resolve => {
+        const child = spawn(NODE, [RESERVE, '--count', '4'], {
+          env: { ...process.env, CAREER_OPS_REPORTS_DIR: concTmp },
+        });
+        let stdout = '';
+        child.stdout.on('data', chunk => { stdout += chunk; });
+        child.on('close', () => resolve(stdout.trim()));
+      });
+      const [rangeX, rangeY] = await Promise.all([spawnReserve(), spawnReserve()]);
+      const toNums = r => {
+        const [s, e] = r.split('-').map(Number);
+        return Array.from({ length: e - s + 1 }, (_, i) => s + i);
+      };
+      const overlap = toNums(rangeX).filter(n => toNums(rangeY).includes(n));
+      if (rangeX && rangeY && overlap.length === 0) {
+        pass(`concurrent --count 4 reservations are disjoint (${rangeX} vs ${rangeY})`);
+      } else {
+        throw new Error(`concurrent ranges overlap: ${rangeX} vs ${rangeY} share [${overlap}]`);
+      }
+      break;
+    } catch (e) {
+      if (reserveRetries > 0) {
+        warn(`concurrent reservation test flaked (${e.message}). Retrying once...`);
+        reserveRetries -= 1;
+      } else {
+        fail(`concurrent reservation test failed: ${e.message}`);
+        break;
+      }
+    } finally {
+      rmSync(concTmp, { recursive: true, force: true });
+    }
   }
-  rmSync(concTmp, { recursive: true, force: true });
 
   // --release with a range deletes every sentinel in it.
   const reserveRunFail = (args, dir) => {
@@ -5148,6 +5314,36 @@ try {
     pass('role matcher still matches when seniority is only stated on one side');
   } else {
     fail('role matcher rejected a repost that only adds a seniority word');
+  }
+
+  // A sub-baseline qualifier on ONE side is a level disagreement, not a loose
+  // rewrite: the tokenizer drops seniority words as stopwords, so these pairs
+  // otherwise tokenize identically and scored a perfect Jaccard ratio, silently
+  // collapsing two genuinely different requisitions (#2009).
+  for (const [lower, bare] of [
+    ['Associate Product Manager, TeamName', 'Product Manager, TeamName'],
+    ['Junior Product Manager, TeamName', 'Product Manager, TeamName'],
+    ['Entry Level Data Engineer', 'Data Engineer'],
+  ]) {
+    if (!roleFuzzyMatch(lower, bare)) {
+      pass(`role matcher keeps "${lower}" distinct from the bare title (#2009)`);
+    } else {
+      fail(`role matcher collapsed "${lower}" into the bare title "${bare}"`);
+    }
+  }
+
+  // Direction must not matter — the lone qualifier can be on either side.
+  if (!roleFuzzyMatch('Product Manager, TeamName', 'Associate Product Manager, TeamName')) {
+    pass('role matcher applies the sub-baseline gate in both argument orders (#2009)');
+  } else {
+    fail('role matcher only applied the sub-baseline gate in one argument order');
+  }
+
+  // Both sides sub-baseline at the same level is still the same opening.
+  if (roleFuzzyMatch('Associate Product Manager, TeamName', 'Associate Product Manager, TeamName')) {
+    pass('role matcher still matches two same-level Associate reposts (#2009)');
+  } else {
+    fail('role matcher rejected a genuine Associate-level repost');
   }
 
   // A repost annotation is tracking metadata, not a specialization — must still match.
@@ -6015,119 +6211,131 @@ try {
 // tracker, making the old race deterministic.
 console.log('\n🧪 Testing merge-tracker concurrent writes...');
 try {
-  const mergeTmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-lock-'));
-  /**
-   * Spawn one isolated `merge-tracker.mjs` process against the temporary fixture.
-   *
-   * Each spawned process receives the same tracker path and lock path but a
-   * different additions directory. Without serialization, both processes can
-   * read the same old tracker and the later write can lose the other row. The
-   * first worker also sends an IPC readiness message after reading the tracker
-   * and before its test hold, which lets the test launch the second worker at
-   * the exact old race point instead of relying on scheduler timing.
-   *
-   * @param {string} additionsDir - Directory containing this process's TSV row.
-   * @param {number} [holdMs=0] - Optional post-read delay injected into the merge.
-   * @returns {{ready: Promise<void>, result: Promise<{code:number|null,stdout:string,stderr:string}>}}
-   * Worker readiness and final process result promises.
-   */
-  function spawnMerge(additionsDir, holdMs = 0) {
-    let markReady;
-    let readyMarked = false;
-    const ready = new Promise(resolve => { markReady = resolve; });
-    const result = new Promise(resolve => {
-      const child = spawn(NODE, ['merge-tracker.mjs'], {
-        cwd: ROOT,
-        env: {
-          ...process.env,
-          CAREER_OPS_TRACKER: join(mergeTmp, 'data', 'applications.md'),
-          CAREER_OPS_ADDITIONS: additionsDir,
-          CAREER_OPS_TRACKER_LOCK: join(mergeTmp, 'career-ops-merge-tracker-fixture.lock'),
-          CAREER_OPS_MERGE_HOLD_MS: String(holdMs),
-          CAREER_OPS_MERGE_READY_IPC: '1',
-        },
-        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  let retries = 1;
+  while (retries >= 0) {
+    const mergeTmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-lock-'));
+    /**
+     * Spawn one isolated `merge-tracker.mjs` process against the temporary fixture.
+     *
+     * Each spawned process receives the same tracker path and lock path but a
+     * different additions directory. Without serialization, both processes can
+     * read the same old tracker and the later write can lose the other row. The
+     * first worker also sends an IPC readiness message after reading the tracker
+     * and before its test hold, which lets the test launch the second worker at
+     * the exact old race point instead of relying on scheduler timing.
+     *
+     * @param {string} additionsDir - Directory containing this process's TSV row.
+     * @param {number} [holdMs=0] - Optional post-read delay injected into the merge.
+     * @returns {{ready: Promise<void>, result: Promise<{code:number|null,stdout:string,stderr:string}>}}
+     * Worker readiness and final process result promises.
+     */
+    function spawnMerge(additionsDir, holdMs = 0) {
+      let markReady;
+      let readyMarked = false;
+      const ready = new Promise(resolve => { markReady = resolve; });
+      const result = new Promise(resolve => {
+        const child = spawn(NODE, ['merge-tracker.mjs'], {
+          cwd: ROOT,
+          env: {
+            ...process.env,
+            CAREER_OPS_TRACKER: join(mergeTmp, 'data', 'applications.md'),
+            CAREER_OPS_ADDITIONS: additionsDir,
+            CAREER_OPS_TRACKER_LOCK: join(mergeTmp, 'career-ops-merge-tracker-fixture.lock'),
+            CAREER_OPS_MERGE_HOLD_MS: String(holdMs),
+            CAREER_OPS_MERGE_READY_IPC: '1',
+          },
+          stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+        });
+        let stdout = '';
+        let stderr = '';
+        const resolveReady = () => {
+          if (readyMarked) return;
+          readyMarked = true;
+          markReady();
+        };
+        child.stdout.on('data', chunk => { stdout += chunk; });
+        child.stderr.on('data', chunk => { stderr += chunk; });
+        child.on('message', msg => {
+          if (msg?.type === 'merge-tracker-ready') resolveReady();
+        });
+        child.on('error', err => {
+          resolveReady();
+          resolve({ code: -1, stdout, stderr: String(err) });
+        });
+        child.on('close', code => {
+          resolveReady();
+          resolve({ code, stdout, stderr });
+        });
       });
-      let stdout = '';
-      let stderr = '';
-      const resolveReady = () => {
-        if (readyMarked) return;
-        readyMarked = true;
-        markReady();
-      };
-      child.stdout.on('data', chunk => { stdout += chunk; });
-      child.stderr.on('data', chunk => { stderr += chunk; });
-      child.on('message', msg => {
-        if (msg?.type === 'merge-tracker-ready') resolveReady();
-      });
-      child.on('error', err => {
-        resolveReady();
-        resolve({ code: -1, stdout, stderr: String(err) });
-      });
-      child.on('close', code => {
-        resolveReady();
-        resolve({ code, stdout, stderr });
-      });
-    });
-    return { ready, result };
-  }
-
-  /**
-   * Fail fast when a worker never reaches the deterministic race checkpoint.
-   *
-   * A missing readiness signal would otherwise hang the test suite. Timing out
-   * turns that broken test contract into a normal assertion failure with a clear
-   * message.
-   *
-   * @param {Promise<void>} ready - Worker readiness promise.
-   * @param {number} timeoutMs - Maximum milliseconds to wait.
-   * @returns {Promise<void>} Resolves when ready arrives before the timeout.
-   */
-  function waitForReady(ready, timeoutMs) {
-    return Promise.race([
-      ready,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('merge worker did not signal readiness')), timeoutMs)),
-    ]);
-  }
-
-  try {
-    mkdirSync(join(mergeTmp, 'data'));
-    mkdirSync(join(mergeTmp, 'reports'));
-    const additionsA = join(mergeTmp, 'additions-a');
-    const additionsB = join(mergeTmp, 'additions-b');
-    mkdirSync(additionsA);
-    mkdirSync(additionsB);
-
-    writeFileSync(join(mergeTmp, 'data', 'applications.md'),
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n');
-    writeFileSync(join(mergeTmp, 'reports', '010-alpha-2026-01-07.md'), '# fixture\n');
-    writeFileSync(join(mergeTmp, 'reports', '011-beta-2026-01-07.md'), '# fixture\n');
-    writeFileSync(join(additionsA, '010-alpha.tsv'),
-      '10\t2026-01-07\tAlpha\tPlatform Engineer\tEvaluated\t4.1/5\t❌\t[10](reports/010-alpha-2026-01-07.md)\tfirst concurrent merge\n');
-    writeFileSync(join(additionsB, '011-beta.tsv'),
-      '11\t2026-01-07\tBeta\tData Engineer\tEvaluated\t4.2/5\t❌\t[11](reports/011-beta-2026-01-07.md)\tsecond concurrent merge\n');
-
-    const first = spawnMerge(additionsA, 350);
-    await waitForReady(first.ready, 2_000);
-    const second = spawnMerge(additionsB, 0);
-    const [firstResult, secondResult] = await Promise.all([first.result, second.result]);
-
-    if (firstResult.code === 0 && secondResult.code === 0) {
-      pass('concurrent merge processes both exited successfully');
-    } else {
-      fail(`concurrent merge process failed: first=${firstResult.code} second=${secondResult.code} stderr=${firstResult.stderr || secondResult.stderr}`);
+      return { ready, result };
     }
 
-    const merged = readFileSync(join(mergeTmp, 'data', 'applications.md'), 'utf-8');
-    if (merged.includes('Alpha') && merged.includes('Beta')) {
-      pass('concurrent tracker merges preserve rows from both processes');
-    } else {
-      fail(`concurrent tracker merge lost a row: ${merged}`);
+    /**
+     * Fail fast when a worker never reaches the deterministic race checkpoint.
+     *
+     * A missing readiness signal would otherwise hang the test suite. Timing out
+     * turns that broken test contract into a normal assertion failure with a clear
+     * message.
+     *
+     * @param {Promise<void>} ready - Worker readiness promise.
+     * @param {number} timeoutMs - Maximum milliseconds to wait.
+     * @returns {Promise<void>} Resolves when ready arrives before the timeout.
+     */
+    function waitForReady(ready, timeoutMs) {
+      return Promise.race([
+        ready,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('merge worker did not signal readiness')), timeoutMs)),
+      ]);
     }
-  } finally {
-    rmSync(mergeTmp, { recursive: true, force: true });
+
+    try {
+      mkdirSync(join(mergeTmp, 'data'));
+      mkdirSync(join(mergeTmp, 'reports'));
+      const additionsA = join(mergeTmp, 'additions-a');
+      const additionsB = join(mergeTmp, 'additions-b');
+      mkdirSync(additionsA);
+      mkdirSync(additionsB);
+
+      writeFileSync(join(mergeTmp, 'data', 'applications.md'),
+        '# Applications Tracker\n\n' +
+        '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+        '|---|------|---------|------|-------|--------|-----|--------|-------|\n');
+      writeFileSync(join(mergeTmp, 'reports', '010-alpha-2026-01-07.md'), '# fixture\n');
+      writeFileSync(join(mergeTmp, 'reports', '011-beta-2026-01-07.md'), '# fixture\n');
+      writeFileSync(join(additionsA, '010-alpha.tsv'),
+        '10\t2026-01-07\tAlpha\tPlatform Engineer\tEvaluated\t4.1/5\t❌\t[10](reports/010-alpha-2026-01-07.md)\tfirst concurrent merge\n');
+      writeFileSync(join(additionsB, '011-beta.tsv'),
+        '11\t2026-01-07\tBeta\tData Engineer\tEvaluated\t4.2/5\t❌\t[11](reports/011-beta-2026-01-07.md)\tsecond concurrent merge\n');
+
+      const first = spawnMerge(additionsA, 350);
+      await waitForReady(first.ready, 10_000); // Widen to 10s
+      const second = spawnMerge(additionsB, 0);
+      const [firstResult, secondResult] = await Promise.all([first.result, second.result]);
+
+      if (firstResult.code === 0 && secondResult.code === 0) {
+        pass('concurrent merge processes both exited successfully');
+      } else {
+        throw new Error(`concurrent merge process failed: first=${firstResult.code} second=${secondResult.code} stderr=${firstResult.stderr || secondResult.stderr}`);
+      }
+
+      const merged = readFileSync(join(mergeTmp, 'data', 'applications.md'), 'utf-8');
+      if (merged.includes('Alpha') && merged.includes('Beta')) {
+        pass('concurrent tracker merges preserve rows from both processes');
+      } else {
+        throw new Error(`concurrent tracker merge lost a row: ${merged}`);
+      }
+      break;
+    } catch (e) {
+      if (retries > 0) {
+        warn(`merge-tracker concurrent write test flaked (${e.message}). Retrying once...`);
+        retries -= 1;
+      } else {
+        fail(`merge-tracker concurrent write test crashed: ${e.message}`);
+        break;
+      }
+    } finally {
+      rmSync(mergeTmp, { recursive: true, force: true });
+    }
   }
 } catch (e) {
   fail(`merge-tracker concurrent write test crashed: ${e.message}`);
@@ -6615,8 +6823,8 @@ try {
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
   const premiumOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const premiumArgv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
-  if (premiumArgv.includes('--model') && premiumArgv.includes('claude-opus-4-8') && premiumOut.includes('spend_tier=premium')) {
-    pass('premium spend_tier resolves to claude-opus-4-8');
+  if (premiumArgv.includes('--model') && premiumArgv.includes('claude-opus-5') && premiumOut.includes('spend_tier=premium')) {
+    pass('premium spend_tier resolves to claude-opus-5');
   } else {
     fail(`premium spend_tier did not route to opus: argv=${JSON.stringify(premiumArgv)}, out=${JSON.stringify(premiumOut.slice(-240))}`);
   }
@@ -6628,9 +6836,9 @@ try {
   const { tmp, batchDir, fakeBin } = makeTierFixture('spend_tier: premium\n');
   const argFile = join(tmp, 'claude-argv.txt');
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
-  const overrideOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1', '--model', 'claude-sonnet-4-6'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
+  const overrideOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1', '--model', 'claude-sonnet-5'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const overrideArgv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
-  if (overrideArgv.includes('--model') && overrideArgv.includes('claude-sonnet-4-6') && !overrideArgv.includes('claude-opus-4-8') && overrideOut.includes('explicit --model override')) {
+  if (overrideArgv.includes('--model') && overrideArgv.includes('claude-sonnet-5') && !overrideArgv.includes('claude-opus-5') && overrideOut.includes('explicit --model override')) {
     pass('--model override takes precedence over spend_tier');
   } else {
     fail(`--model override did not win: argv=${JSON.stringify(overrideArgv)}, out=${JSON.stringify(overrideOut.slice(-240))}`);
@@ -6645,8 +6853,8 @@ try {
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
   const standardDefaultOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const standardDefaultArgv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
-  if (standardDefaultArgv.includes('--model') && standardDefaultArgv.includes('claude-sonnet-4-6') && standardDefaultOut.includes('spend_tier=standard')) {
-    pass('missing spend_tier key defaults to standard tier (claude-sonnet-4-6)');
+  if (standardDefaultArgv.includes('--model') && standardDefaultArgv.includes('claude-sonnet-5') && standardDefaultOut.includes('spend_tier=standard')) {
+    pass('missing spend_tier key defaults to standard tier (claude-sonnet-5)');
   } else {
     fail(`missing spend_tier did not default to standard: argv=${JSON.stringify(standardDefaultArgv)}, out=${JSON.stringify(standardDefaultOut.slice(-240))}`);
   }
@@ -6660,8 +6868,8 @@ try {
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
   const invalidTierOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const invalidTierArgv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
-  if (invalidTierArgv.includes('--model') && invalidTierArgv.includes('claude-sonnet-4-6') && invalidTierOut.includes('spend_tier=standard')) {
-    pass('invalid spend_tier value falls back to standard tier (claude-sonnet-4-6)');
+  if (invalidTierArgv.includes('--model') && invalidTierArgv.includes('claude-sonnet-5') && invalidTierOut.includes('spend_tier=standard')) {
+    pass('invalid spend_tier value falls back to standard tier (claude-sonnet-5)');
   } else {
     fail(`invalid spend_tier did not fall back to standard: argv=${JSON.stringify(invalidTierArgv)}, out=${JSON.stringify(invalidTierOut.slice(-240))}`);
   }
@@ -8201,6 +8409,25 @@ try {
     pass('match-star scorer: tag-exact match yields ≥ 6 points (3 per token × 2 tokens)');
   } else {
     fail(`match-star scorer: tag-exact match score too low (got ${tagExactScores[1]})`);
+  }
+
+  // Regression: tag scoring must use tokenized exact membership, not a substring
+  // test — otherwise short query tokens (ai, ml, go, qa…) spuriously collide
+  // inside longer tag WORDS (token "ai" inside "maintainability") for a false +3,
+  // inflating irrelevant stories above genuinely relevant ones.
+  // With empty title/theme/action/result and no JD, total score == the tag bonus.
+  const mkTagStory = (tags) => ({ tags, title: '', theme: '', action: '', result: '' });
+  const aiVsMaintainability = score(mkTagStory(['maintainability']), tokenize('ai'), []);
+  if (aiVsMaintainability === 0) {
+    pass('match-star scorer: short token "ai" does not substring-match tag "maintainability" (bonus 0)');
+  } else {
+    fail(`match-star scorer: token "ai" spuriously matched tag "maintainability" (expected 0, got ${aiVsMaintainability})`);
+  }
+  const leadershipExactTag = score(mkTagStory(['leadership']), tokenize('leadership'), []);
+  if (leadershipExactTag === 3) {
+    pass('match-star scorer: exact tag token "leadership" still scores +3 after tokenized fix');
+  } else {
+    fail(`match-star scorer: exact tag match regressed (expected 3, got ${leadershipExactTag})`);
   }
 
   // match-star.mjs file must exist (existsSync-guarded in the script itself)

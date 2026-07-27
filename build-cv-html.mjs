@@ -483,10 +483,11 @@ function buildSkills(categories, partial) {
 }
 
 // Rebuild the whole .contact-row block. Its markup uses fixed "|" separators
-// between phone / email / linkedin / portfolio / location, so an absent optional
-// field (phone, linkedin, portfolio) must drop BOTH its <a> and one separator.
-// Building the present items and joining them is more robust than excising
-// separators from the template one placeholder at a time.
+// between phone / email / linkedin / github / portfolio / location, so an
+// absent optional field (phone, linkedin, github, portfolio) must drop BOTH
+// its <a> and one separator. Building the present items and joining them is
+// more robust than excising separators from the template one placeholder at
+// a time.
 function buildContactRow(candidate) {
   const c = candidate || {};
   const items = [];
@@ -499,6 +500,12 @@ function buildContactRow(candidate) {
   }
   if (c.linkedin && c.linkedin.url) {
     items.push(`<a href="${sanitizeUrl(c.linkedin.url)}">${escapeHtml(c.linkedin.display || c.linkedin.url)}</a>`);
+  }
+  if (c.github && c.github.url) {
+    const githubHref = sanitizeUrl(c.github.url);
+    if (githubHref) {
+      items.push(`<a href="${githubHref}">${escapeHtml(c.github.display || c.github.url)}</a>`);
+    }
   }
   if (c.portfolio && c.portfolio.url) {
     items.push(`<a href="${sanitizeUrl(c.portfolio.url)}">${escapeHtml(c.portfolio.display || c.portfolio.url)}</a>`);
@@ -685,6 +692,7 @@ async function runSelfTest() {
       phone: '+1 234 567 8900',
       email: 'test@example.com',
       linkedin: { url: 'https://linkedin.com/in/test', display: 'linkedin.com/in/test' },
+      github: { url: 'https://github.com/test', display: 'github.com/test' },
       portfolio: { url: 'https://test.example.com', display: 'test.example.com' },
       location: 'City, State',
     },
@@ -816,6 +824,43 @@ async function runSelfTest() {
   // The partial should emit an empty <span class="cert-org"> for alignment.
   if (!certHtml.includes('class="cert-org"')) {
     console.error('Self-test failed: cert-org empty-block not emitted for table alignment');
+    process.exit(1);
+  }
+
+  // Guard the github contact-row case added for #2170: the link must render
+  // with the sanitized href from the sample.
+  if (!html.includes('href="https://github.com/test"')) {
+    console.error('Self-test failed: github contact link missing from output');
+    process.exit(1);
+  }
+
+  // Guard the absent-field side of the same case: omitting candidate.github
+  // must drop both its anchor and its separator, leaving no dangling item.
+  const { github, ...candidateWithoutGithub } = sample.candidate;
+  const htmlWithoutGithub = renderHtml(template, { ...sample, candidate: candidateWithoutGithub });
+  const countSeparators = (h) => (h.match(/class="separator"/g) || []).length;
+  if (htmlWithoutGithub.includes('github.com/test')) {
+    console.error('Self-test failed: github contact link rendered when candidate.github is absent');
+    process.exit(1);
+  }
+  if (countSeparators(htmlWithoutGithub) !== countSeparators(html) - 1) {
+    console.error('Self-test failed: omitting candidate.github left a dangling separator in the contact row');
+    process.exit(1);
+  }
+
+  // Guard the rejected-scheme side: sanitizeUrl() must reject javascript:/data:
+  // github URLs, which must drop the item and separator exactly like an
+  // absent field, never fall through to an empty href="".
+  const htmlWithRejectedGithub = renderHtml(template, {
+    ...sample,
+    candidate: { ...sample.candidate, github: { url: 'javascript:alert(1)', display: 'github.com/test' } },
+  });
+  if (htmlWithRejectedGithub.includes('href=""') || htmlWithRejectedGithub.includes('github.com/test')) {
+    console.error('Self-test failed: rejected github URL still rendered a contact item');
+    process.exit(1);
+  }
+  if (countSeparators(htmlWithRejectedGithub) !== countSeparators(html) - 1) {
+    console.error('Self-test failed: rejected github URL left a dangling separator in the contact row');
     process.exit(1);
   }
 
